@@ -1,3 +1,4 @@
+git remote set-url origin https://github.com/LeakOS-Linux/Revil-Cipher.git
 git init
 git add .
 git commit -m "first commit"
